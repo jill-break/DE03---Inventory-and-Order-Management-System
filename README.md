@@ -76,10 +76,3 @@ Customer details (including City/Country) are stored once in the Customers table
 **Data Integrity:** CHECK (price >= 0) and CHECK (quantity >= 0) prevent bad data.
 
 **TIMESTAMPTZ** ensures timezone-aware date tracking.
-
-### 3. How to Run
-**Execute ecommerce_lab_ddl.sql**
-First to build the empty database structure.
-
-**Execute ecommerce_lab_dml.sql**
-to populate sample data and run the analysis queries.
