@@ -322,6 +322,7 @@ LEFT JOIN orders o ON c.customer_id = o.customer_id
 WHERE o.status IN ('Shipped', 'Delivered') OR o.status IS NULL
 GROUP BY c.customer_id, c.full_name, c.email, c.city, c.country;
 
+
 -- Stored Procedure: ProcessNewOrder
 CREATE OR REPLACE PROCEDURE ProcessNewOrder(
     p_customer_id INT,
@@ -370,5 +371,107 @@ BEGIN
 EXCEPTION
     WHEN OTHERS THEN
         RAISE NOTICE 'Transaction rolled back: %', SQLERRM;
+END;
+$$;
+
+
+-- Stored Procedure 2: RestockInventory 
+CREATE OR REPLACE PROCEDURE RestockInventory(
+    p_product_id INT,
+    p_quantity INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- 1. Validation
+    IF p_quantity <= 0 THEN
+        RAISE EXCEPTION 'Restock quantity must be positive. Received: %', p_quantity;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM products WHERE product_id = p_product_id) THEN
+         RAISE EXCEPTION 'Product ID % does not exist', p_product_id;
+    END IF;
+
+    -- 2. Update Inventory
+    UPDATE inventory
+    SET quantity_on_hand = quantity_on_hand + p_quantity,
+        last_updated = CURRENT_TIMESTAMP
+    WHERE product_id = p_product_id;
+
+    RAISE NOTICE 'Successfully added % units to Product ID %', p_quantity, p_product_id;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Restock Failed: %', SQLERRM;
+END;
+$$;
+
+-- Stored Procedure 3: ProcessBulkOrder (JSON Payload)
+CREATE OR REPLACE PROCEDURE ProcessBulkOrder(
+    p_order_payload JSONB
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_customer_id INT;
+    v_new_order_id INT;
+    v_total_order_amount DECIMAL(12, 2) := 0;
+    v_item RECORD;
+    v_price DECIMAL(10, 2);
+    v_stock INT;
+BEGIN
+    -- 1. Extract Customer ID
+    v_customer_id := (p_order_payload->>'customer_id')::INT;
+
+    -- Verify Customer Exists
+    IF NOT EXISTS (SELECT 1 FROM customers WHERE customer_id = v_customer_id) THEN
+        RAISE EXCEPTION 'Customer ID % not found', v_customer_id;
+    END IF;
+
+    -- 2. Create Order Header (Initial placeholder)
+    INSERT INTO orders (customer_id, total_amount, status)
+    VALUES (v_customer_id, 0.00, 'Pending')
+    RETURNING order_id INTO v_new_order_id;
+
+    -- 3. Loop through items in the JSON array
+    FOR v_item IN SELECT * FROM jsonb_to_recordset(p_order_payload->'items') AS x(product_id INT, quantity INT)
+    LOOP
+        -- Check Price and Stock for this specific item
+        SELECT p.price, i.quantity_on_hand INTO v_price, v_stock
+        FROM products p
+        JOIN inventory i ON p.product_id = i.product_id
+        WHERE p.product_id = v_item.product_id;
+
+        IF v_price IS NULL THEN
+            RAISE EXCEPTION 'Product % does not exist', v_item.product_id;
+        END IF;
+
+        IF v_stock < v_item.quantity THEN
+            RAISE EXCEPTION 'Insufficient stock for Product %. Have %, Need %', v_item.product_id, v_stock, v_item.quantity;
+        END IF;
+
+        -- Update Inventory
+        UPDATE inventory
+        SET quantity_on_hand = quantity_on_hand - v_item.quantity
+        WHERE product_id = v_item.product_id;
+
+        -- Create Order Item
+        INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase, discount_amount)
+        VALUES (v_new_order_id, v_item.product_id, v_item.quantity, v_price, 0.00);
+
+        -- Add to running total
+        v_total_order_amount := v_total_order_amount + (v_price * v_item.quantity);
+    END LOOP;
+
+    -- 4. Finalize Order Total
+    UPDATE orders 
+    SET total_amount = v_total_order_amount 
+    WHERE order_id = v_new_order_id;
+
+    RAISE NOTICE 'Bulk Order % processed successfully for Customer %. Total: %', v_new_order_id, v_customer_id, v_total_order_amount;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Bulk Order Failed & Rolled Back: %', SQLERRM;
 END;
 $$;
