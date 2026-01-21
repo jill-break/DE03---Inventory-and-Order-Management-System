@@ -107,3 +107,113 @@ EXCEPTION
         RAISE;
 END;
 $$;
+
+
+-- =============================================
+-- Feature 1: Auto-Restock Trigger
+-- =============================================
+
+CREATE OR REPLACE FUNCTION check_and_restock()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Check if the new stock level has fallen to (or below) the reorder threshold
+    IF NEW.quantity_on_hand <= NEW.reorder_level THEN
+        
+        -- 1. Log the Low Stock Alert
+        INSERT INTO system_error_log (procedure_name, error_message)
+        VALUES ('AutoRestock', 'Low stock detected for Product ' || NEW.product_id || '. Triggering Restock.');
+
+        -- 2. "Magically" Restock (Simulate a supplier delivery)
+        -- We add 50 units. This will fire the Audit Trigger we made earlier, 
+        -- so we get a perfect history trail automatically.
+        UPDATE inventory
+        SET quantity_on_hand = quantity_on_hand + 50
+        WHERE inventory_id = NEW.inventory_id;
+        
+        RAISE NOTICE 'AUTO-RESTOCK: Product % was replenished by 50 units.', NEW.product_id;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach the trigger to the Inventory table
+DROP TRIGGER IF EXISTS trg_auto_restock ON inventory;
+CREATE TRIGGER trg_auto_restock
+AFTER UPDATE ON inventory
+FOR EACH ROW
+WHEN (NEW.quantity_on_hand < OLD.quantity_on_hand) -- Only run when stock is GOING DOWN
+EXECUTE FUNCTION check_and_restock();
+
+
+-- =============================================
+-- Feature 2: Process Bulk Order (JSONB Version)
+-- =============================================
+
+CREATE OR REPLACE PROCEDURE ProcessBulkOrder(
+    p_payload JSONB
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_customer_id UUID;
+    v_order_id UUID;
+    v_item JSONB;
+    v_product_id UUID;
+    v_qty INT;
+    v_price DECIMAL(10,2);
+    v_current_stock INT;
+    v_total DECIMAL(12,2) := 0;
+BEGIN
+    -- 1. Extract Customer ID from JSON
+    v_customer_id := (p_payload->>'customer_id')::UUID;
+
+    -- 2. Create the "Head" Order (Empty Total initially)
+    INSERT INTO orders (customer_id, status)
+    VALUES (v_customer_id, 'Pending')
+    RETURNING order_id INTO v_order_id;
+
+    -- 3. Loop through the "items" array in the JSON
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_payload->'items')
+    LOOP
+        -- Extract Item Details
+        v_product_id := (v_item->>'product_id')::UUID;
+        v_qty := (v_item->>'quantity')::INT;
+
+        -- Check Stock & Price (Locking row)
+        SELECT price, quantity_on_hand INTO v_price, v_current_stock
+        FROM inventory i
+        JOIN products p ON i.product_id = p.product_id
+        WHERE i.product_id = v_product_id
+        FOR UPDATE;
+
+        IF v_current_stock < v_qty THEN
+            RAISE EXCEPTION 'Insufficient stock for Product %. Have %, Need %', v_product_id, v_current_stock, v_qty;
+        END IF;
+
+        -- Update Inventory (Triggers Audit AND Auto-Restock if needed)
+        UPDATE inventory 
+        SET quantity_on_hand = quantity_on_hand - v_qty
+        WHERE product_id = v_product_id;
+
+        -- Create Order Item
+        INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase)
+        VALUES (v_order_id, v_product_id, v_qty, v_price);
+
+        -- Add to Total
+        v_total := v_total + (v_price * v_qty);
+    END LOOP;
+
+    -- 4. Update Final Total
+    UPDATE orders SET total_amount = v_total WHERE order_id = v_order_id;
+
+    RAISE NOTICE 'Bulk Order % processed successfully. Total: %', v_order_id, v_total;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- Log the JSON payload that caused the crash for debugging
+        INSERT INTO system_error_log (procedure_name, error_message)
+        VALUES ('ProcessBulkOrder', SQLERRM || ' Payload: ' || p_payload::TEXT);
+        RAISE; -- Rollback transaction
+END;
+$$;
